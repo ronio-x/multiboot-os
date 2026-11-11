@@ -16,12 +16,12 @@ jobs:
           sudo apt-get install -y python3 python3-pip
           pip3 install --upgrade platformio esptool
 
-      - name: Generate Complete C++ Launcher (Hacker Theme & Direct Landscape)
+      - name: Generate Complete C++ Launcher with Rollback Disabled
         run: |
           mkdir -p launcher_project/src
           mkdir -p launcher_project/include
 
-          # ১. ১৬ MB পার্টিশন টেবিল
+          # ১. অফিসিয়াল ১৬ MB পার্টিশন টেবিল (MicroPython অটো-মাউন্ট VFS ড্রাইভ সহ)
           cat << 'EOF' > launcher_project/partitions.csv
           # Name,   Type, SubType, Offset,   Size,     Flags
           nvs,      data, nvs,     0x9000,   0x6000,
@@ -31,7 +31,7 @@ jobs:
           vfs,      data, fat,     0x720000, 0x8e0000,
           EOF
 
-          # ২. PlatformIO কনফিগারেশন
+          # ২. PlatformIO কনফিগারেশন (রোলব্যাক পারমানেন্টলি বন্ধ করা)
           cat << 'EOF' > launcher_project/platformio.ini
           [env:esp32-s3-launcher]
           platform = espressif32
@@ -51,7 +51,7 @@ jobs:
               lovyan03/LovyanGFX @ ^1.1.16
           EOF
 
-          # ৩. মাস্টার লঞ্চারের C++ কোড (পিওর ব্ল্যাক ও গ্রিন হ্যাকার স্টাইল)
+          # ৩. মাস্টার লঞ্চারের মূল C++ সোর্স কোড (লাল বাটন ও স্থায়ী ওএস সেভার)
           cat << 'EOF' > launcher_project/src/main.cpp
           #define LGFX_USE_V1
           #include <LovyanGFX.hpp>
@@ -91,7 +91,7 @@ jobs:
                       cfg.panel_height = 320;
                       cfg.offset_rotation = 0;
                       cfg.rgb_order = false;
-                      cfg.invert = false; // কালার ফিক্স (কালো ব্যাকগ্রাউন্ড)
+                      cfg.invert = true;
                       _panel.config(cfg);
                   }
                   {
@@ -107,17 +107,17 @@ jobs:
 
           #define PIN_JOY_X 1
           #define PIN_JOY_Y 2
-          #define PIN_B1    5   // Boot OS
+          #define PIN_B1    5   // Boot
           #define PIN_B2    6   // Reload
-          #define PIN_B3    40  // Rotate Screen
+          #define PIN_B3    40  // Live Screen Rotate
 
           WebServer server(80);
           std::vector<String> bin_files;
           std::vector<size_t> bin_sizes;
           int selected_index = 0;
           
-          // ৬ নম্বর ক্লিকের ১৮০ ডিগ্রি সোজা রোটেশন (রোটেশন ৬ দিয়ে শুরু)
-          int all_rotations[] = {6, 4, 7, 5, 1, 3, 0, 2};
+          // ৮টি রোটেশন মোডস (B3 চাপলেই সাথে সাথে স্ক্রিন সোজা হবে)
+          int all_rotations[] = {1, 3, 5, 7, 0, 2, 4, 6};
           int rot_idx = 0;
 
           void scan_firmwares() {
@@ -148,12 +148,12 @@ jobs:
           void draw_ui() {
               tft.fillScreen(TFT_BLACK);
 
-              // হেডার বার (৩২০ পিক্সেল ল্যান্ডস্কেপ — হ্যাকার গ্রিন)
-              tft.fillRect(0, 0, 320, 26, 0x01E0); // ডার্ক গ্রিন হেডার
-              tft.setTextColor(0x07E0);            // উজ্জ্বল নিয়ন গ্রিন
+              // হেডার বার
+              tft.fillRect(0, 0, 320, 26, 0x18E3);
+              tft.setTextColor(0xC7E0);
               tft.setTextSize(2);
               tft.drawString("MULTI-BOOT LAUNCHER", 10, 5);
-              tft.drawFastHLine(0, 26, 320, 0x07E0);
+              tft.drawFastHLine(0, 26, 320, 0x39E7);
 
               int y = 36;
               if (bin_files.empty()) {
@@ -162,7 +162,7 @@ jobs:
                   tft.drawString("No firmwares found!", 15, 55);
 
                   tft.setTextSize(1);
-                  tft.setTextColor(0x07E0);
+                  tft.setTextColor(0x07FF);
                   tft.drawString("WiFi: Handheld-OS (Pass: 12345678)", 15, 95);
                   tft.drawString("Phone Browser: http://192.168.4.1", 15, 115);
                   tft.drawString("Upload OS .bin files directly!", 15, 135);
@@ -176,10 +176,10 @@ jobs:
                       }
 
                       if ((int)i == selected_index) {
-                          tft.fillRect(6, y - 2, 308, 30, 0x07E0); // সলিড নিয়ন গ্রিন হাইলাইট
-                          tft.setTextColor(TFT_BLACK);             // ব্ল্যাক টেক্সট
+                          tft.fillRect(6, y - 2, 308, 30, 0xC7E0);
+                          tft.setTextColor(TFT_BLACK);
                       } else {
-                          tft.fillRect(6, y - 2, 308, 30, 0x0120); // ডার্ক হ্যাকার রো
+                          tft.fillRect(6, y - 2, 308, 30, 0x10A2);
                           tft.setTextColor(TFT_WHITE);
                       }
                       tft.drawString(String(i + 1) + ". " + display_name, 12, y + 5);
@@ -189,10 +189,10 @@ jobs:
               }
 
               // ফুটার
-              tft.drawFastHLine(0, 214, 320, 0x07E0);
+              tft.drawFastHLine(0, 214, 320, 0x39E7);
               tft.setTextSize(1);
-              tft.setTextColor(0x07E0);
-              tft.drawString("Joy: Move | B1: Boot | B3: Rotate | IP: 192.168.4.1", 10, 222);
+              tft.setTextColor(TFT_LIGHTGRAY);
+              tft.drawString("Joy: Move | B1: Boot | B3: Rotate Screen", 10, 222);
           }
 
           File uploadFile;
@@ -201,10 +201,10 @@ jobs:
 
               server.on("/", HTTP_GET, []() {
                   String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
-                  html += "body{background:#0a0a0a;color:#00e676;font-family:sans-serif;padding:20px;text-align:center;}";
+                  html += "body{background:#111;color:#fff;font-family:sans-serif;padding:20px;text-align:center;}";
                   html += "input{padding:12px;margin:10px;font-size:16px;border-radius:6px;width:90%;max-width:320px;}";
-                  html += ".btn-red{background:#D32F2F;color:#ffffff;font-size:18px;font-weight:bold;padding:15px;border:none;border-radius:8px;width:90%;max-width:320px;cursor:pointer;}";
-                  html += ".box{background:#1a1a1a;color:#fff;padding:15px;border-radius:8px;margin:15px auto;max-width:320px;text-align:left;}";
+                  html += ".btn-red{background:#E53935;color:#fff;font-size:18px;font-weight:bold;padding:15px;border:none;border-radius:8px;width:90%;max-width:320px;cursor:pointer;}";
+                  html += ".box{background:#222;padding:15px;border-radius:8px;margin:15px auto;max-width:320px;text-align:left;}";
                   html += "</style></head><body>";
                   html += "<h2>Handheld Multi-OS Uploader</h2>";
                   html += "<form method='POST' action='/upload' enctype='multipart/form-data'>";
@@ -226,7 +226,7 @@ jobs:
               });
 
               server.on("/upload", HTTP_POST, []() {
-                  server.send(200, "text/html", "<h3>Upload Success!</h3><a href='/' style='color:#00e676;'>Back</a>");
+                  server.send(200, "text/html", "<h3>Upload Success!</h3><a href='/'>Back</a>");
                   scan_firmwares();
                   draw_ui();
               }, []() {
@@ -248,7 +248,7 @@ jobs:
               server.begin();
           }
 
-          // স্মার্ট 0x0 স্কিপ ফ্ল্যাশার
+          // পারমানেন্ট ফ্ল্যাশার (রোলব্যাক ছাড়াই স্থায়ীভাবে ওএস সেট করবে)
           void flash_and_reboot(String filename) {
               String path = "/firmwares/" + filename;
               if (!path.startsWith("/")) path = "/" + path;
@@ -260,7 +260,7 @@ jobs:
               size_t appOffset = 0;
               size_t appSize = totalSize;
 
-              // 0x0 Merged ফাইল চেক
+              // 0x0 Merged ফাইল চেক ও বুটলোডার স্কিপ
               if (totalSize > 0x10000) {
                   file.seek(0x8000);
                   uint8_t part_magic[2];
@@ -287,9 +287,9 @@ jobs:
               file.seek(appOffset);
 
               tft.fillScreen(TFT_BLACK);
-              tft.setTextColor(0x07E0);
+              tft.setTextColor(0xC7E0);
               tft.setTextSize(2);
-              tft.drawString("FLASHING TO SLOT 2...", 15, 40);
+              tft.drawString("PERMANENT FLASHING...", 15, 40);
               tft.drawRect(15, 80, 290, 24, TFT_WHITE);
 
               const esp_partition_t* target = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
@@ -314,13 +314,17 @@ jobs:
 
                   if (Update.end(true)) {
                       tft.setTextColor(0x07E0);
-                      tft.drawString("SUCCESS! REBOOTING...", 15, 120);
-                      delay(1000);
+                      tft.drawString("SUCCESS! PERMANENT BOOT", 15, 120);
+                      
+                      // স্থায়ী বুট সেট করা এবং রোলব্যাক বাতিল করা
                       esp_ota_set_boot_partition(target);
+                      esp_ota_mark_app_valid_cancel_rollback();
+                      
+                      delay(1000);
                       ESP.restart();
                   } else {
                       tft.setTextColor(TFT_RED);
-                      tft.drawString("OTA Update Error!", 15, 120);
+                      tft.drawString("Update Error!", 15, 120);
                       delay(3000);
                   }
               }
@@ -337,7 +341,7 @@ jobs:
               pinMode(PIN_B2, INPUT_PULLUP);
               pinMode(PIN_B3, INPUT_PULLUP);
 
-              LittleFS.begin(true);
+              LittleFS.begin(true, "/vfs", 10, "vfs");
               setup_web_server();
               scan_firmwares();
               draw_ui();
@@ -361,7 +365,7 @@ jobs:
                   }
               }
 
-              // B1: ওএস বুট
+              // B1: ওএস স্থায়ীভাবে বুট
               if (digitalRead(PIN_B1) == LOW) {
                   delay(150);
                   if (!bin_files.empty()) {
@@ -376,9 +380,9 @@ jobs:
                   draw_ui();
               }
 
-              // B3: রোটেশন সাইকেল (যেকোনো এঙ্গেলে সোজা করার জন্য)
+              // B3: লাইভ রোটেশন সাইকেল (০ থেকে ৭) — টিপলেই ডিসপ্লে সোজা হবে!
               if (digitalRead(PIN_B3) == LOW) {
-                  delay(200);
+                  delay(250);
                   rot_idx = (rot_idx + 1) % 8;
                   tft.setRotation(all_rotations[rot_idx]);
                   draw_ui();

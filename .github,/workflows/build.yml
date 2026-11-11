@@ -1,0 +1,411 @@
+name: Build Master Multi-Boot Launcher (ESP32-S3)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python & Install PlatformIO
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip
+          pip3 install --upgrade platformio esptool
+
+      - name: Generate Complete C++ Launcher (Hacker Theme & Direct Landscape)
+        run: |
+          mkdir -p launcher_project/src
+          mkdir -p launcher_project/include
+
+          # ১. ১৬ MB পার্টিশন টেবিল
+          cat << 'EOF' > launcher_project/partitions.csv
+          # Name,   Type, SubType, Offset,   Size,     Flags
+          nvs,      data, nvs,     0x9000,   0x6000,
+          otadata,  data, ota,     0xf000,   0x2000,
+          app0,     app,  ota_0,   0x20000,  0x380000,
+          app1,     app,  ota_1,   0x3a0000, 0x380000,
+          vfs,      data, fat,     0x720000, 0x8e0000,
+          EOF
+
+          # ২. PlatformIO কনফিগারেশন
+          cat << 'EOF' > launcher_project/platformio.ini
+          [env:esp32-s3-launcher]
+          platform = espressif32
+          board = esp32-s3-devkitc-1
+          framework = arduino
+          board_build.flash_mode = qio
+          board_build.f_flash = 80000000L
+          board_upload.flash_size = 16MB
+          board_build.partitions = partitions.csv
+          board_build.filesystem = littlefs
+          build_flags =
+              -DBOARD_HAS_PSRAM
+              -mfix-esp32-psram-cache-issue
+              -DCONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=0
+              -DCORE_DEBUG_LEVEL=0
+          lib_deps =
+              lovyan03/LovyanGFX @ ^1.1.16
+          EOF
+
+          # ৩. মাস্টার লঞ্চারের C++ কোড (পিওর ব্ল্যাক ও গ্রিন হ্যাকার স্টাইল)
+          cat << 'EOF' > launcher_project/src/main.cpp
+          #define LGFX_USE_V1
+          #include <LovyanGFX.hpp>
+          #include <Arduino.h>
+          #include <WiFi.h>
+          #include <WebServer.h>
+          #include <FS.h>
+          #include <LittleFS.h>
+          #include <Update.h>
+          #include <esp_ota_ops.h>
+          #include <esp_partition.h>
+          #include <vector>
+
+          class LGFX : public lgfx::LGFX_Device {
+              lgfx::Panel_ILI9341 _panel;
+              lgfx::Bus_SPI       _bus;
+              lgfx::Light_PWM     _light;
+          public:
+              LGFX() {
+                  {
+                      auto cfg = _bus.config();
+                      cfg.spi_host = SPI2_HOST;
+                      cfg.spi_mode = 0;
+                      cfg.freq_write = 40000000;
+                      cfg.pin_sclk = 12;
+                      cfg.pin_mosi = 11;
+                      cfg.pin_miso = 13;
+                      cfg.pin_dc   = 8;
+                      _bus.config(cfg);
+                      _panel.setBus(&_bus);
+                  }
+                  {
+                      auto cfg = _panel.config();
+                      cfg.pin_cs   = 10;
+                      cfg.pin_rst  = 9;
+                      cfg.panel_width  = 240;
+                      cfg.panel_height = 320;
+                      cfg.offset_rotation = 0;
+                      cfg.rgb_order = false;
+                      cfg.invert = false; // কালার ফিক্স (কালো ব্যাকগ্রাউন্ড)
+                      _panel.config(cfg);
+                  }
+                  {
+                      auto cfg = _light.config();
+                      cfg.pin_bl = 7;
+                      _light.config(cfg);
+                      _panel.setLight(&_light);
+                  }
+                  setPanel(&_panel);
+              }
+          };
+          LGFX tft;
+
+          #define PIN_JOY_X 1
+          #define PIN_JOY_Y 2
+          #define PIN_B1    5   // Boot OS
+          #define PIN_B2    6   // Reload
+          #define PIN_B3    40  // Rotate Screen
+
+          WebServer server(80);
+          std::vector<String> bin_files;
+          std::vector<size_t> bin_sizes;
+          int selected_index = 0;
+          
+          // ৬ নম্বর ক্লিকের ১৮০ ডিগ্রি সোজা রোটেশন (রোটেশন ৬ দিয়ে শুরু)
+          int all_rotations[] = {6, 4, 7, 5, 1, 3, 0, 2};
+          int rot_idx = 0;
+
+          void scan_firmwares() {
+              bin_files.clear();
+              bin_sizes.clear();
+
+              if (!LittleFS.exists("/firmwares")) {
+                  LittleFS.mkdir("/firmwares");
+                  LittleFS.mkdir("/games");
+                  LittleFS.mkdir("/wallpapers");
+                  LittleFS.mkdir("/font");
+              }
+
+              File root = LittleFS.open("/firmwares");
+              if (root && root.isDirectory()) {
+                  File file = root.openNextFile();
+                  while (file) {
+                      String name = file.name();
+                      if (name.endsWith(".bin")) {
+                          bin_files.push_back(name);
+                          bin_sizes.push_back(file.size());
+                      }
+                      file = root.openNextFile();
+                  }
+              }
+          }
+
+          void draw_ui() {
+              tft.fillScreen(TFT_BLACK);
+
+              // হেডার বার (৩২০ পিক্সেল ল্যান্ডস্কেপ — হ্যাকার গ্রিন)
+              tft.fillRect(0, 0, 320, 26, 0x01E0); // ডার্ক গ্রিন হেডার
+              tft.setTextColor(0x07E0);            // উজ্জ্বল নিয়ন গ্রিন
+              tft.setTextSize(2);
+              tft.drawString("MULTI-BOOT LAUNCHER", 10, 5);
+              tft.drawFastHLine(0, 26, 320, 0x07E0);
+
+              int y = 36;
+              if (bin_files.empty()) {
+                  tft.setTextColor(TFT_WHITE);
+                  tft.setTextSize(2);
+                  tft.drawString("No firmwares found!", 15, 55);
+
+                  tft.setTextSize(1);
+                  tft.setTextColor(0x07E0);
+                  tft.drawString("WiFi: Handheld-OS (Pass: 12345678)", 15, 95);
+                  tft.drawString("Phone Browser: http://192.168.4.1", 15, 115);
+                  tft.drawString("Upload OS .bin files directly!", 15, 135);
+              } else {
+                  tft.setTextSize(2);
+                  for (size_t i = 0; i < bin_files.size() && i < 5; i++) {
+                      float mb = (float)bin_sizes[i] / (1024.0 * 1024.0);
+                      String display_name = bin_files[i];
+                      if (display_name.length() > 17) {
+                          display_name = display_name.substring(0, 14) + "..";
+                      }
+
+                      if ((int)i == selected_index) {
+                          tft.fillRect(6, y - 2, 308, 30, 0x07E0); // সলিড নিয়ন গ্রিন হাইলাইট
+                          tft.setTextColor(TFT_BLACK);             // ব্ল্যাক টেক্সট
+                      } else {
+                          tft.fillRect(6, y - 2, 308, 30, 0x0120); // ডার্ক হ্যাকার রো
+                          tft.setTextColor(TFT_WHITE);
+                      }
+                      tft.drawString(String(i + 1) + ". " + display_name, 12, y + 5);
+                      tft.drawRightString(String(mb, 1) + "MB", 305, y + 5);
+                      y += 34;
+                  }
+              }
+
+              // ফুটার
+              tft.drawFastHLine(0, 214, 320, 0x07E0);
+              tft.setTextSize(1);
+              tft.setTextColor(0x07E0);
+              tft.drawString("Joy: Move | B1: Boot | B3: Rotate | IP: 192.168.4.1", 10, 222);
+          }
+
+          File uploadFile;
+          void setup_web_server() {
+              WiFi.softAP("Handheld-OS", "12345678");
+
+              server.on("/", HTTP_GET, []() {
+                  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
+                  html += "body{background:#0a0a0a;color:#00e676;font-family:sans-serif;padding:20px;text-align:center;}";
+                  html += "input{padding:12px;margin:10px;font-size:16px;border-radius:6px;width:90%;max-width:320px;}";
+                  html += ".btn-red{background:#D32F2F;color:#ffffff;font-size:18px;font-weight:bold;padding:15px;border:none;border-radius:8px;width:90%;max-width:320px;cursor:pointer;}";
+                  html += ".box{background:#1a1a1a;color:#fff;padding:15px;border-radius:8px;margin:15px auto;max-width:320px;text-align:left;}";
+                  html += "</style></head><body>";
+                  html += "<h2>Handheld Multi-OS Uploader</h2>";
+                  html += "<form method='POST' action='/upload' enctype='multipart/form-data'>";
+                  html += "<input type='file' name='update' accept='.bin'><br>";
+                  html += "<button type='submit' class='btn-red'>UPLOAD FIRMWARE (.BIN)</button>";
+                  html += "</form>";
+
+                  html += "<div class='box'><b>Current Firmwares in /firmwares:</b><br>";
+                  File root = LittleFS.open("/firmwares");
+                  if (root && root.isDirectory()) {
+                      File f = root.openNextFile();
+                      while (f) {
+                          html += "- " + String(f.name()) + " (" + String((float)f.size() / (1024.0 * 1024.0), 1) + " MB)<br>";
+                          f = root.openNextFile();
+                      }
+                  }
+                  html += "</div></body></html>";
+                  server.send(200, "text/html", html);
+              });
+
+              server.on("/upload", HTTP_POST, []() {
+                  server.send(200, "text/html", "<h3>Upload Success!</h3><a href='/' style='color:#00e676;'>Back</a>");
+                  scan_firmwares();
+                  draw_ui();
+              }, []() {
+                  HTTPUpload& upload = server.upload();
+                  if (upload.status == UPLOAD_FILE_START) {
+                      String filename = upload.filename;
+                      if (!filename.startsWith("/")) filename = "/" + filename;
+                      uploadFile = LittleFS.open("/firmwares" + filename, "w");
+                  } else if (upload.status == UPLOAD_FILE_WRITE) {
+                      if (uploadFile) uploadFile.write(upload.buf, upload.currentSize);
+                  } else if (upload.status == UPLOAD_FILE_END) {
+                      if (uploadFile) {
+                          uploadFile.flush();
+                          uploadFile.close();
+                      }
+                  }
+              });
+
+              server.begin();
+          }
+
+          // স্মার্ট 0x0 স্কিপ ফ্ল্যাশার
+          void flash_and_reboot(String filename) {
+              String path = "/firmwares/" + filename;
+              if (!path.startsWith("/")) path = "/" + path;
+
+              File file = LittleFS.open(path, "r");
+              if (!file) return;
+
+              size_t totalSize = file.size();
+              size_t appOffset = 0;
+              size_t appSize = totalSize;
+
+              // 0x0 Merged ফাইল চেক
+              if (totalSize > 0x10000) {
+                  file.seek(0x8000);
+                  uint8_t part_magic[2];
+                  file.read(part_magic, 2);
+
+                  if (part_magic[0] == 0xAA && part_magic[1] == 0x50) {
+                      file.seek(0x10000);
+                      uint8_t magic;
+                      file.read(&magic, 1);
+                      if (magic == 0xE9) {
+                          appOffset = 0x10000;
+                          appSize = totalSize - 0x10000;
+                      } else {
+                          file.seek(0x20000);
+                          file.read(&magic, 1);
+                          if (magic == 0xE9) {
+                              appOffset = 0x20000;
+                              appSize = totalSize - 0x20000;
+                          }
+                      }
+                  }
+              }
+
+              file.seek(appOffset);
+
+              tft.fillScreen(TFT_BLACK);
+              tft.setTextColor(0x07E0);
+              tft.setTextSize(2);
+              tft.drawString("FLASHING TO SLOT 2...", 15, 40);
+              tft.drawRect(15, 80, 290, 24, TFT_WHITE);
+
+              const esp_partition_t* target = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
+              if (!target) target = esp_ota_get_next_update_partition(NULL);
+
+              if (target && Update.begin(appSize, U_FLASH)) {
+                  size_t written = 0;
+                  uint8_t buff[4096];
+                  while (written < appSize && file.available()) {
+                      size_t toRead = sizeof(buff);
+                      if (appSize - written < toRead) toRead = appSize - written;
+
+                      size_t len = file.read(buff, toRead);
+                      if (len == 0) break;
+
+                      Update.write(buff, len);
+                      written += len;
+
+                      int progress = (written * 286) / appSize;
+                      tft.fillRect(17, 82, progress, 20, 0x07E0);
+                  }
+
+                  if (Update.end(true)) {
+                      tft.setTextColor(0x07E0);
+                      tft.drawString("SUCCESS! REBOOTING...", 15, 120);
+                      delay(1000);
+                      esp_ota_set_boot_partition(target);
+                      ESP.restart();
+                  } else {
+                      tft.setTextColor(TFT_RED);
+                      tft.drawString("OTA Update Error!", 15, 120);
+                      delay(3000);
+                  }
+              }
+              file.close();
+              draw_ui();
+          }
+
+          void setup() {
+              tft.init();
+              tft.setRotation(all_rotations[rot_idx]);
+              tft.fillScreen(TFT_BLACK);
+
+              pinMode(PIN_B1, INPUT_PULLUP);
+              pinMode(PIN_B2, INPUT_PULLUP);
+              pinMode(PIN_B3, INPUT_PULLUP);
+
+              LittleFS.begin(true);
+              setup_web_server();
+              scan_firmwares();
+              draw_ui();
+          }
+
+          void loop() {
+              server.handleClient();
+
+              int joy_x = analogRead(PIN_JOY_X);
+              static unsigned long last_move = 0;
+
+              if (millis() - last_move > 250) {
+                  if (joy_x < 1000 && selected_index > 0) {
+                      selected_index--;
+                      draw_ui();
+                      last_move = millis();
+                  } else if (joy_x > 3000 && selected_index < (int)bin_files.size() - 1) {
+                      selected_index++;
+                      draw_ui();
+                      last_move = millis();
+                  }
+              }
+
+              // B1: ওএস বুট
+              if (digitalRead(PIN_B1) == LOW) {
+                  delay(150);
+                  if (!bin_files.empty()) {
+                      flash_and_reboot(bin_files[selected_index]);
+                  }
+              }
+
+              // B2: রিলোড
+              if (digitalRead(PIN_B2) == LOW) {
+                  delay(150);
+                  scan_firmwares();
+                  draw_ui();
+              }
+
+              // B3: রোটেশন সাইকেল (যেকোনো এঙ্গেলে সোজা করার জন্য)
+              if (digitalRead(PIN_B3) == LOW) {
+                  delay(200);
+                  rot_idx = (rot_idx + 1) % 8;
+                  tft.setRotation(all_rotations[rot_idx]);
+                  draw_ui();
+              }
+
+              delay(20);
+          }
+          EOF
+
+      - name: Build and Merge Master Firmware
+        run: |
+          cd launcher_project
+          pio run
+          
+          echo "Merging Complete Binary..."
+          cd .pio/build/esp32-s3-launcher
+          esptool.py --chip esp32s3 merge_bin \
+            -o Master_Launcher_Complete_0x0.bin \
+            --flash_mode qio --flash_size 16MB \
+            0x0 bootloader.bin \
+            0x8000 partitions.bin \
+            0x20000 firmware.bin
+
+          ls -lh Master_Launcher_Complete_0x0.bin
+
+      - name: Upload Complete Merged Launcher (.bin)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Master-MultiBoot-Complete-0x0
+          path: launcher_project/.pio/build/esp32-s3-launcher/Master_Launcher_Complete_0x0.bin

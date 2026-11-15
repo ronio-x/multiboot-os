@@ -1,4 +1,4 @@
-name: Build Master Multi-Boot Launcher (ESP32-S3)
+name: Build Master Multi-Boot Launcher (Final Pro)
 
 on:
   workflow_dispatch:
@@ -16,12 +16,12 @@ jobs:
           sudo apt-get install -y python3 python3-pip
           pip3 install --upgrade platformio esptool
 
-      - name: Generate Complete C++ Launcher with Rollback Disabled
+      - name: Generate Pro Multi-Boot Launcher Project
         run: |
           mkdir -p launcher_project/src
           mkdir -p launcher_project/include
 
-          # ১. অফিসিয়াল ১৬ MB পার্টিশন টেবিল (MicroPython অটো-মাউন্ট VFS ড্রাইভ সহ)
+          # ১. ১৬ MB শেয়ার্ড ২-স্লট পার্টিশন টেবিল (MicroPython & GameBoy সেম)
           cat << 'EOF' > launcher_project/partitions.csv
           # Name,   Type, SubType, Offset,   Size,     Flags
           nvs,      data, nvs,     0x9000,   0x6000,
@@ -31,7 +31,7 @@ jobs:
           vfs,      data, fat,     0x720000, 0x8e0000,
           EOF
 
-          # ২. PlatformIO কনফিগারেশন (রোলব্যাক পারমানেন্টলি বন্ধ করা)
+          # ২. PlatformIO কনফিগারেশন (N16R8 Octal PSRAM + O3 + LittleFS)
           cat << 'EOF' > launcher_project/platformio.ini
           [env:esp32-s3-launcher]
           platform = espressif32
@@ -40,18 +40,19 @@ jobs:
           board_build.flash_mode = qio
           board_build.f_flash = 80000000L
           board_upload.flash_size = 16MB
+          board_build.arduino.memory_type = qio_opi
           board_build.partitions = partitions.csv
           board_build.filesystem = littlefs
           build_flags =
+              -O3
               -DBOARD_HAS_PSRAM
               -mfix-esp32-psram-cache-issue
-              -DCONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=0
               -DCORE_DEBUG_LEVEL=0
           lib_deps =
               lovyan03/LovyanGFX @ ^1.1.16
           EOF
 
-          # ৩. মাস্টার লঞ্চারের মূল C++ সোর্স কোড (লাল বাটন ও স্থায়ী ওএস সেভার)
+          # ৩. মাস্টার লঞ্চার C++ সোর্স কোড (গেমবয় ভেরিফাইড স্ট্রাকচার অনুযায়ী)
           cat << 'EOF' > launcher_project/src/main.cpp
           #define LGFX_USE_V1
           #include <LovyanGFX.hpp>
@@ -65,6 +66,7 @@ jobs:
           #include <esp_partition.h>
           #include <vector>
 
+          // --- LovyanGFX ডিসপ্লে ড্রাইভার (গেমবয়ের পরীক্ষিত ৩২০x২৪০ কনফিগ) ---
           class LGFX : public lgfx::LGFX_Device {
               lgfx::Panel_ILI9341 _panel;
               lgfx::Bus_SPI       _bus;
@@ -87,11 +89,13 @@ jobs:
                       auto cfg = _panel.config();
                       cfg.pin_cs   = 10;
                       cfg.pin_rst  = 9;
-                      cfg.panel_width  = 240;
-                      cfg.panel_height = 320;
+                      cfg.memory_width  = 320;
+                      cfg.memory_height = 240;
+                      cfg.panel_width   = 320;
+                      cfg.panel_height  = 240;
                       cfg.offset_rotation = 0;
-                      cfg.rgb_order = false;
-                      cfg.invert = true;
+                      cfg.rgb_order = true;
+                      cfg.invert = false;
                       _panel.config(cfg);
                   }
                   {
@@ -107,28 +111,118 @@ jobs:
 
           #define PIN_JOY_X 1
           #define PIN_JOY_Y 2
-          #define PIN_B1    5   // Boot
-          #define PIN_B2    6   // Reload
-          #define PIN_B3    40  // Live Screen Rotate
+          #define PIN_B1    5   // Select / Confirm
+          #define PIN_B2    6   // Back / Reload
+          #define PIN_B3    40  // System Menu / Options
 
           WebServer server(80);
-          std::vector<String> bin_files;
-          std::vector<size_t> bin_sizes;
-          int selected_index = 0;
-          
-          // ৮টি রোটেশন মোডস (B3 চাপলেই সাথে সাথে স্ক্রিন সোজা হবে)
-          int all_rotations[] = {1, 3, 5, 7, 0, 2, 4, 6};
-          int rot_idx = 0;
+          std::vector<String> menu_items;
+          std::vector<size_t> item_sizes;
+          std::vector<bool>   item_is_quick;
+          bool slot2_ready = false;
+
+          int selected_idx = 0;
+          int scroll_top   = 0;
+          const int VISIBLE_ROWS = 6;
+
+          // ৪টি গ্লোবাল থিম (গেমবয়ের সাথে সিঙ্কড)
+          struct UITheme {
+              const char* name;
+              uint16_t primary;
+              uint16_t dark_card;
+          };
+          UITheme ui_themes[4] = {
+              { "HACKER GREEN", 0x07E0, 0x0120 },
+              { "AMBER GOLD",   0xFD20, 0x2080 },
+              { "CYBER CYAN",   0x07FF, 0x0188 },
+              { "RETRO MONO",   0xFFFF, 0x2104 }
+          };
+          int active_theme  = 0;
+          int backlight_pct = 80;
+
+          // ৩০ সেকেন্ড অটো-স্লিপ ও অ্যানিমেশন
+          #define IDLE_TIMEOUT_MS 30000
+          unsigned long last_activity_ms = 0;
+          bool is_sleeping = false;
+          bool mascot_blink = false;
+
+          enum LauncherState { STATE_HOME, STATE_SYS_MENU, STATE_CONFIRM };
+          LauncherState app_state = STATE_HOME;
+          int sys_menu_sel = 0;
+          int confirm_sel  = 1; // ডিফল্ট NO
+
+          void draw_home_ui();
+          void draw_sys_menu();
+          void draw_confirm_dialog();
+
+          void load_configs() {
+              File fb = LittleFS.open("/backlight.cfg", "r");
+              if (fb) {
+                  String val = fb.readStringUntil('\n');
+                  val.trim();
+                  int b = val.toInt();
+                  if (b >= 5 && b <= 100) backlight_pct = b;
+                  fb.close();
+              }
+              tft.setBrightness((backlight_pct * 255) / 100);
+
+              File ft = LittleFS.open("/gb_theme.cfg", "r");
+              if (ft) {
+                  String val = ft.readStringUntil('\n');
+                  val.trim();
+                  int t = val.toInt();
+                  if (t >= 0 && t < 4) active_theme = t;
+                  ft.close();
+              }
+          }
+
+          void save_brightness(int val) {
+              backlight_pct = constrain(val, 5, 100);
+              if (!is_sleeping) tft.setBrightness((backlight_pct * 255) / 100);
+              File f = LittleFS.open("/backlight.cfg", "w");
+              if (f) { f.print(backlight_pct); f.close(); }
+          }
+
+          void save_theme(int t) {
+              active_theme = t % 4;
+              File f = LittleFS.open("/gb_theme.cfg", "w");
+              if (f) { f.print(active_theme); f.close(); }
+          }
+
+          uint16_t get_temp_color(int t) {
+              if (t < 50) return 0x07E0;
+              if (t < 69) return TFT_YELLOW;
+              return TFT_RED;
+          }
+
+          bool check_slot2_valid() {
+              const esp_partition_t* ota1 = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
+              if (!ota1) return false;
+              uint8_t magic = 0;
+              if (esp_partition_read(ota1, 0, &magic, 1) == ESP_OK) {
+                  return (magic == 0xE9);
+              }
+              return false;
+          }
+
+          void ensure_dirs() {
+              const char* dirs[] = {"/firmwares", "/games", "/wallpapers", "/font"};
+              for (int i = 0; i < 4; i++) {
+                  if (!LittleFS.exists(dirs[i])) LittleFS.mkdir(dirs[i]);
+              }
+          }
 
           void scan_firmwares() {
-              bin_files.clear();
-              bin_sizes.clear();
+              menu_items.clear();
+              item_sizes.clear();
+              item_is_quick.clear();
+              ensure_dirs();
 
-              if (!LittleFS.exists("/firmwares")) {
-                  LittleFS.mkdir("/firmwares");
-                  LittleFS.mkdir("/games");
-                  LittleFS.mkdir("/wallpapers");
-                  LittleFS.mkdir("/font");
+              slot2_ready = check_slot2_valid();
+              if (slot2_ready) {
+                  menu_items.push_back(">> Quick Boot Slot 2");
+                  item_sizes.push_back(0);
+                  item_is_quick.push_back(true);
               }
 
               File root = LittleFS.open("/firmwares");
@@ -136,131 +230,226 @@ jobs:
                   File file = root.openNextFile();
                   while (file) {
                       String name = file.name();
+                      int slash = name.lastIndexOf('/');
+                      if (slash >= 0) name = name.substring(slash + 1);
                       if (name.endsWith(".bin")) {
-                          bin_files.push_back(name);
-                          bin_sizes.push_back(file.size());
+                          menu_items.push_back(name);
+                          item_sizes.push_back(file.size());
+                          item_is_quick.push_back(false);
                       }
                       file = root.openNextFile();
                   }
               }
+
+              int total = menu_items.size();
+              if (selected_idx >= total) selected_idx = (total > 0) ? total - 1 : 0;
+              if (scroll_top > selected_idx) scroll_top = selected_idx;
           }
 
-          void draw_ui() {
-              tft.fillScreen(TFT_BLACK);
-
-              // হেডার বার
-              tft.fillRect(0, 0, 320, 26, 0x18E3);
-              tft.setTextColor(0xC7E0);
+          void update_top_temp_only() {
+              if (app_state != STATE_HOME || is_sleeping) return;
+              int t = (int)temperatureRead();
+              UITheme th = ui_themes[active_theme];
+              tft.fillRect(148, 2, 86, 20, th.dark_card);
               tft.setTextSize(2);
-              tft.drawString("MULTI-BOOT LAUNCHER", 10, 5);
-              tft.drawFastHLine(0, 26, 320, 0x39E7);
+              tft.setTextColor(get_temp_color(t));
+              tft.drawString("T:" + String(t) + "C", 152, 4);
+          }
 
-              int y = 36;
-              if (bin_files.empty()) {
+          // ছোট লাইটওয়েট অ্যানিমেটেড মিনি-বট (সিস্টেম মেনুতে)
+          void draw_mini_bot(int x, int y, uint16_t col, bool blink) {
+              tft.fillRect(x, y, 22, 18, 0x0000);
+              tft.drawRect(x + 3, y + 4, 16, 12, col);
+              tft.drawFastVLine(x + 11, y, 4, col);
+              tft.fillCircle(x + 11, y, 2, TFT_RED);
+              if (blink) {
+                  tft.drawFastHLine(x + 6, y + 9, 3, col);
+                  tft.drawFastHLine(x + 13, y + 9, 3, col);
+              } else {
+                  tft.fillRect(x + 6, y + 8, 3, 3, col);
+                  tft.fillRect(x + 13, y + 8, 3, 3, col);
+              }
+              tft.drawFastHLine(x + 8, y + 13, 6, col);
+          }
+
+          void draw_home_ui() {
+              tft.fillScreen(TFT_BLACK);
+              UITheme th = ui_themes[active_theme];
+              int total = menu_items.size();
+
+              // টপ স্ট্যাটাস বার
+              tft.fillRect(0, 0, 320, 24, th.dark_card);
+              tft.setTextColor(th.primary);
+              tft.setTextSize(2);
+              tft.drawString("MULTI-BOOT", 8, 4);
+
+              int t = (int)temperatureRead();
+              tft.setTextColor(get_temp_color(t));
+              tft.drawString("T:" + String(t) + "C", 152, 4);
+
+              tft.setTextColor(TFT_WHITE);
+              if (total > 0) {
+                  tft.drawRightString("[" + String(selected_idx + 1) + "/" + String(total) + "]", 314, 4);
+              } else {
+                  tft.drawRightString("[0/0]", 314, 4);
+              }
+              tft.drawFastHLine(0, 24, 320, th.primary);
+
+              // ১ থেকে ৬টি স্ক্রোলযোগ্য আইটেম + ডানদিকে স্ক্রোলবার
+              int y = 30;
+              if (total == 0) {
                   tft.setTextColor(TFT_WHITE);
                   tft.setTextSize(2);
-                  tft.drawString("No firmwares found!", 15, 55);
-
+                  tft.drawCenterString("No firmwares found!", 160, 75);
                   tft.setTextSize(1);
-                  tft.setTextColor(0x07FF);
-                  tft.drawString("WiFi: Handheld-OS (Pass: 12345678)", 15, 95);
-                  tft.drawString("Phone Browser: http://192.168.4.1", 15, 115);
-                  tft.drawString("Upload OS .bin files directly!", 15, 135);
+                  tft.setTextColor(th.primary);
+                  tft.drawCenterString("WiFi: Handheld-OS | Pass: 12345678", 160, 115);
+                  tft.drawCenterString("Open Browser: http://192.168.4.1", 160, 135);
+                  tft.setTextColor(TFT_WHITE);
+                  tft.drawCenterString("dev: github/ronio-x", 160, 165);
               } else {
                   tft.setTextSize(2);
-                  for (size_t i = 0; i < bin_files.size() && i < 5; i++) {
-                      float mb = (float)bin_sizes[i] / (1024.0 * 1024.0);
-                      String display_name = bin_files[i];
-                      if (display_name.length() > 17) {
-                          display_name = display_name.substring(0, 14) + "..";
-                      }
+                  for (int slot = 0; slot < VISIBLE_ROWS; slot++) {
+                      int idx = scroll_top + slot;
+                      if (idx < total) {
+                          if (idx == selected_idx) {
+                              tft.fillRect(6, y - 2, 300, 28, th.primary);
+                              tft.setTextColor(TFT_BLACK);
+                          } else {
+                              tft.fillRect(6, y - 2, 300, 28, th.dark_card);
+                              tft.setTextColor(item_is_quick[idx] ? TFT_CYAN : TFT_WHITE);
+                          }
 
-                      if ((int)i == selected_index) {
-                          tft.fillRect(6, y - 2, 308, 30, 0xC7E0);
-                          tft.setTextColor(TFT_BLACK);
-                      } else {
-                          tft.fillRect(6, y - 2, 308, 30, 0x10A2);
-                          tft.setTextColor(TFT_WHITE);
+                          if (item_is_quick[idx]) {
+                              tft.drawString(menu_items[idx], 12, y + 4);
+                          } else {
+                              String dname = menu_items[idx];
+                              if (dname.length() > 14) dname = dname.substring(0, 12) + "..";
+                              float mb = (float)item_sizes[idx] / 1048576.0;
+                              tft.drawString(String(idx + 1) + ". " + dname, 12, y + 4);
+                              tft.drawRightString(String(mb, 1) + "M", 300, y + 4);
+                          }
+                          y += 30;
                       }
-                      tft.drawString(String(i + 1) + ". " + display_name, 12, y + 5);
-                      tft.drawRightString(String(mb, 1) + "MB", 305, y + 5);
-                      y += 34;
                   }
+
+                  // সাইড স্ক্রোলবার
+                  int bar_h = 178;
+                  tft.fillRect(312, 28, 4, bar_h, 0x2104);
+                  int thumb_h = bar_h;
+                  int thumb_y = 28;
+                  if (total > VISIBLE_ROWS) {
+                      int calc_h = (bar_h * VISIBLE_ROWS) / total;
+                      thumb_h = (calc_h > 18) ? calc_h : 18;
+                      int max_top = total - VISIBLE_ROWS;
+                      thumb_y = 28 + ((bar_h - thumb_h) * scroll_top) / (max_top > 0 ? max_top : 1);
+                  }
+                  tft.fillRect(312, thumb_y, 4, thumb_h, th.primary);
               }
 
               // ফুটার
-              tft.drawFastHLine(0, 214, 320, 0x39E7);
+              tft.drawFastHLine(0, 214, 320, th.primary);
+              tft.setTextSize(1);
+              tft.setTextColor(th.primary);
+              tft.drawString("B1:Boot | B3:Menu | http://192.168.4.1", 8, 223);
+          }
+
+          void draw_sys_menu() {
+              UITheme th = ui_themes[active_theme];
+
+              tft.fillRect(20, 20, 280, 200, 0x0841);
+              tft.drawRect(20, 20, 280, 200, th.primary);
+              tft.setTextColor(th.primary);
+              tft.setTextSize(2);
+              tft.drawString("SYSTEM MENU", 35, 28);
+              tft.drawFastHLine(30, 50, 260, th.primary);
+
+              // ১. ব্রাইটনেস বার
+              int y = 58;
+              bool sel0 = (sys_menu_sel == 0);
+              tft.fillRect(30, y, 260, 44, sel0 ? th.dark_card : 0x0000);
+              tft.drawRect(30, y, 260, 44, sel0 ? th.primary : 0x2104);
+              tft.setTextSize(1);
+              tft.setTextColor(sel0 ? th.primary : TFT_WHITE);
+              tft.drawString("Brightness [< >]: " + String(backlight_pct) + "%", 38, y + 6);
+              tft.drawRect(38, y + 20, 244, 12, TFT_WHITE);
+              tft.fillRect(40, y + 22, (backlight_pct * 240) / 100, 8, th.primary);
+
+              // ২. ৪টি থিম
+              y = 110;
+              bool sel1 = (sys_menu_sel == 1);
+              tft.fillRect(30, y, 260, 34, sel1 ? th.primary : th.dark_card);
+              tft.setTextColor(sel1 ? TFT_BLACK : TFT_WHITE);
+              tft.setTextSize(2);
+              tft.drawString("Theme: " + String(th.name), 38, y + 9);
+
+              // ৩. বামপাশে ক্রেডিট ও ডানপাশে অ্যানিমেটেড মিনি-বট
               tft.setTextSize(1);
               tft.setTextColor(TFT_LIGHTGRAY);
-              tft.drawString("Joy: Move | B1: Boot | B3: Rotate Screen", 10, 222);
+              tft.drawString("dev: github/ronio-x", 34, 198);
+              draw_mini_bot(262, 186, th.primary, mascot_blink);
+
+              tft.setTextColor(th.primary);
+              tft.drawString("B1/Joy:Change | B2/B3:Close", 34, 178);
           }
 
-          File uploadFile;
-          void setup_web_server() {
-              WiFi.softAP("Handheld-OS", "12345678");
+          void draw_confirm_dialog() {
+              UITheme th = ui_themes[active_theme];
+              tft.fillRect(30, 45, 260, 145, 0x0841);
+              tft.drawRect(30, 45, 260, 145, TFT_WHITE);
+              tft.setTextColor(th.primary);
+              tft.setTextSize(2);
+              tft.drawCenterString("CONFIRM BOOT", 160, 58);
 
-              server.on("/", HTTP_GET, []() {
-                  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'><style>";
-                  html += "body{background:#111;color:#fff;font-family:sans-serif;padding:20px;text-align:center;}";
-                  html += "input{padding:12px;margin:10px;font-size:16px;border-radius:6px;width:90%;max-width:320px;}";
-                  html += ".btn-red{background:#E53935;color:#fff;font-size:18px;font-weight:bold;padding:15px;border:none;border-radius:8px;width:90%;max-width:320px;cursor:pointer;}";
-                  html += ".box{background:#222;padding:15px;border-radius:8px;margin:15px auto;max-width:320px;text-align:left;}";
-                  html += "</style></head><body>";
-                  html += "<h2>Handheld Multi-OS Uploader</h2>";
-                  html += "<form method='POST' action='/upload' enctype='multipart/form-data'>";
-                  html += "<input type='file' name='update' accept='.bin'><br>";
-                  html += "<button type='submit' class='btn-red'>UPLOAD FIRMWARE (.BIN)</button>";
-                  html += "</form>";
+              tft.setTextSize(1);
+              tft.setTextColor(TFT_WHITE);
+              String target_n = menu_items[selected_idx];
+              if (target_n.length() > 32) target_n = target_n.substring(0, 29) + "...";
+              tft.drawCenterString(target_n, 160, 85);
+              tft.drawCenterString(item_is_quick[selected_idx] ? "Boot existing Slot 2?" : "Flash to Slot 2 & Boot?", 160, 102);
 
-                  html += "<div class='box'><b>Current Firmwares in /firmwares:</b><br>";
-                  File root = LittleFS.open("/firmwares");
-                  if (root && root.isDirectory()) {
-                      File f = root.openNextFile();
-                      while (f) {
-                          html += "- " + String(f.name()) + " (" + String((float)f.size() / (1024.0 * 1024.0), 1) + " MB)<br>";
-                          f = root.openNextFile();
-                      }
-                  }
-                  html += "</div></body></html>";
-                  server.send(200, "text/html", html);
-              });
+              if (confirm_sel == 0) {
+                  tft.fillRect(50, 132, 90, 34, th.primary);
+                  tft.setTextColor(TFT_BLACK);
+              } else {
+                  tft.fillRect(50, 132, 90, 34, 0x18E3);
+                  tft.setTextColor(TFT_WHITE);
+              }
+              tft.setTextSize(2);
+              tft.drawCenterString("YES", 95, 141);
 
-              server.on("/upload", HTTP_POST, []() {
-                  server.send(200, "text/html", "<h3>Upload Success!</h3><a href='/'>Back</a>");
-                  scan_firmwares();
-                  draw_ui();
-              }, []() {
-                  HTTPUpload& upload = server.upload();
-                  if (upload.status == UPLOAD_FILE_START) {
-                      String filename = upload.filename;
-                      if (!filename.startsWith("/")) filename = "/" + filename;
-                      uploadFile = LittleFS.open("/firmwares" + filename, "w");
-                  } else if (upload.status == UPLOAD_FILE_WRITE) {
-                      if (uploadFile) uploadFile.write(upload.buf, upload.currentSize);
-                  } else if (upload.status == UPLOAD_FILE_END) {
-                      if (uploadFile) {
-                          uploadFile.flush();
-                          uploadFile.close();
-                      }
-                  }
-              });
-
-              server.begin();
+              if (confirm_sel == 1) {
+                  tft.fillRect(180, 132, 90, 34, 0xE000);
+                  tft.setTextColor(TFT_WHITE);
+              } else {
+                  tft.fillRect(180, 132, 90, 34, 0x18E3);
+                  tft.setTextColor(TFT_WHITE);
+              }
+              tft.drawCenterString("NO", 225, 141);
           }
 
-          // পারমানেন্ট ফ্ল্যাশার (রোলব্যাক ছাড়াই স্থায়ীভাবে ওএস সেট করবে)
+          void boot_slot2_now() {
+              const esp_partition_t* ota1 = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
+              if (ota1) {
+                  tft.fillScreen(TFT_BLACK);
+                  tft.setTextColor(ui_themes[active_theme].primary);
+                  tft.setTextSize(2);
+                  tft.drawCenterString("BOOTING SLOT 2...", 160, 110);
+                  esp_ota_set_boot_partition(ota1);
+                  delay(200);
+                  ESP.restart();
+              }
+          }
+
           void flash_and_reboot(String filename) {
               String path = "/firmwares/" + filename;
-              if (!path.startsWith("/")) path = "/" + path;
-
               File file = LittleFS.open(path, "r");
               if (!file) return;
 
               size_t totalSize = file.size();
               size_t appOffset = 0;
-              size_t appSize = totalSize;
+              size_t appSize   = totalSize;
 
-              // 0x0 Merged ফাইল চেক ও বুটলোডার স্কিপ
               if (totalSize > 0x10000) {
                   file.seek(0x8000);
                   uint8_t part_magic[2];
@@ -285,11 +474,12 @@ jobs:
               }
 
               file.seek(appOffset);
+              UITheme th = ui_themes[active_theme];
 
               tft.fillScreen(TFT_BLACK);
-              tft.setTextColor(0xC7E0);
+              tft.setTextColor(th.primary);
               tft.setTextSize(2);
-              tft.drawString("PERMANENT FLASHING...", 15, 40);
+              tft.drawString("FLASHING TO SLOT 2...", 15, 40);
               tft.drawRect(15, 80, 290, 24, TFT_WHITE);
 
               const esp_partition_t* target = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
@@ -309,32 +499,215 @@ jobs:
                       written += len;
 
                       int progress = (written * 286) / appSize;
-                      tft.fillRect(17, 82, progress, 20, 0x07E0);
+                      tft.fillRect(17, 82, progress, 20, th.primary);
                   }
 
                   if (Update.end(true)) {
                       tft.setTextColor(0x07E0);
-                      tft.drawString("SUCCESS! PERMANENT BOOT", 15, 120);
-                      
-                      // স্থায়ী বুট সেট করা এবং রোলব্যাক বাতিল করা
+                      tft.drawString("SUCCESS! REBOOTING...", 15, 125);
                       esp_ota_set_boot_partition(target);
-                      esp_ota_mark_app_valid_cancel_rollback();
-                      
-                      delay(1000);
+                      delay(800);
                       ESP.restart();
                   } else {
                       tft.setTextColor(TFT_RED);
-                      tft.drawString("Update Error!", 15, 120);
-                      delay(3000);
+                      tft.drawString("OTA Update Error!", 15, 125);
+                      delay(2500);
                   }
               }
               file.close();
-              draw_ui();
+              draw_home_ui();
+          }
+
+          // --- পূর্ণাঙ্গ ওয়েব ফাইল ম্যানেজার (সব ফোল্ডার, আপলোড, ডিলিট, রিনেম, ডাউনলোড, পার্টিশন ডাটা) ---
+          File uploadFile;
+          String cur_web_dir = "/";
+
+          String fmt_size(size_t b) {
+              if (b >= 1048576) return String((float)b / 1048576.0, 2) + " MB";
+              if (b >= 1024) return String((float)b / 1024.0, 1) + " KB";
+              return String(b) + " B";
+          }
+
+          void setup_web_server() {
+              WiFi.softAP("Handheld-OS", "12345678");
+
+              // ১. মেইন ফাইল এক্সপ্লোরার (Chunked Response — র‍্যাম ফ্র্যাগমেন্টেশন ০%)
+              server.on("/", HTTP_GET, []() {
+                  String dir = server.hasArg("dir") ? server.arg("dir") : "/";
+                  if (!dir.startsWith("/")) dir = "/" + dir;
+                  if (dir.length() > 1 && dir.endsWith("/")) dir.remove(dir.length() - 1);
+                  cur_web_dir = dir;
+
+                  size_t totalB = LittleFS.totalBytes();
+                  size_t usedB  = LittleFS.usedBytes();
+                  size_t freeB  = (totalB > usedB) ? (totalB - usedB) : 0;
+
+                  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+                  server.send(200, "text/html", "");
+
+                  String hdr = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
+                  hdr += "<title>Handheld Web Manager</title><style>";
+                  hdr += "body{background:#0b0c10;color:#eee;font-family:sans-serif;margin:0;padding:12px;}";
+                  hdr += "h2{color:#00e676;margin:0 0 4px 0;} .sub{color:#888;font-size:12px;margin-bottom:12px;}";
+                  hdr += ".card{background:#16181f;border:1px solid #2b2f3a;border-radius:8px;padding:12px;margin-bottom:12px;}";
+                  hdr += ".path{color:#00e5ff;font-weight:bold;margin-bottom:8px;word-break:break-all;}";
+                  hdr += "input{width:100%;box-sizing:border-box;padding:9px;margin:4px 0;background:#0b0c10;color:#fff;border:1px solid #333;border-radius:5px;}";
+                  hdr += ".btn{padding:11px;border:none;border-radius:6px;font-weight:bold;width:100%;cursor:pointer;margin-top:6px;font-size:14px;}";
+                  hdr += ".btn-red{background:#E53935;color:#fff;} .btn-blue{background:#2979ff;color:#fff;width:auto;padding:8px 14px;margin:0;}";
+                  hdr += ".row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #222;}";
+                  hdr += "a{color:#fff;text-decoration:none;word-break:break-all;} .dir{color:#c8f400;font-weight:bold;}";
+                  hdr += ".acts{display:flex;gap:5px;flex-shrink:0;align-items:center;}";
+                  hdr += ".tag{padding:4px 7px;border-radius:4px;font-size:11px;color:#fff;text-decoration:none;cursor:pointer;border:none;}";
+                  hdr += ".t-dl{background:#2962ff;} .t-ren{background:#ff9100;color:#000;} .t-del{background:#ff3d00;}";
+                  hdr += "#pbox{display:none;margin-top:8px;} #pbar{width:100%;height:14px;background:#222;border-radius:7px;overflow:hidden;}";
+                  hdr += "#pfill{width:0%;height:100%;background:#00e676;} #ptxt{font-size:12px;color:#00e676;text-align:center;margin-top:4px;}";
+                  hdr += "</style></head><body>";
+                  hdr += "<h2>Handheld Multi-OS Manager</h2>";
+                  hdr += "<div class='sub'>dev: github/ronio-x | VFS Free: " + fmt_size(freeB) + " / " + fmt_size(totalB) + " | Slot2: " + String(slot2_ready ? "READY" : "EMPTY") + "</div>";
+                  server.sendContent(hdr);
+
+                  String upCard = "<div class='card'><div class='path'>Current Folder: " + dir + "</div>";
+                  upCard += "<input type='file' id='fi'><button class='btn btn-red' onclick='upFile()'>UPLOAD TO " + dir + "</button>";
+                  upCard += "<div id='pbox'><div id='pbar'><div id='pfill'></div></div><div id='ptxt'>0%</div></div></div>";
+                  upCard += "<div class='card' style='display:flex;gap:6px;'><input type='text' id='nf' placeholder='New folder name...' style='margin:0;'>";
+                  upCard += "<button class='btn btn-blue' onclick='mkDir()'>+ Folder</button></div><div class='card'>";
+                  server.sendContent(upCard);
+
+                  if (dir != "/") {
+                      int lastSlash = dir.lastIndexOf('/');
+                      String parent = (lastSlash <= 0) ? "/" : dir.substring(0, lastSlash);
+                      server.sendContent("<div class='row'><a class='dir' href='/?dir=" + parent + "'>.. [Back]</a></div>");
+                  }
+
+                  File root = LittleFS.open(dir);
+                  if (root && root.isDirectory()) {
+                      File f = root.openNextFile();
+                      while (f) {
+                          String name = f.name();
+                          int sl = name.lastIndexOf('/');
+                          if (sl >= 0) name = name.substring(sl + 1);
+                          String full = (dir == "/") ? ("/" + name) : (dir + "/" + name);
+                          String row = "<div class='row'>";
+                          if (f.isDirectory()) {
+                              row += "<a class='dir' href='/?dir=" + full + "'>[DIR] " + name + "</a>";
+                              row += "<div class='acts'>";
+                              row += "<button class='tag t-ren' onclick=\"renItem('" + full + "','" + name + "')\">Ren</button>";
+                              row += "<a class='tag t-del' href='/del?path=" + full + "&dir=" + dir + "' onclick=\"return confirm('Delete folder?')\">Del</a>";
+                              row += "</div>";
+                          } else {
+                              row += "<span>" + name + "</span><div class='acts'>";
+                              row += "<span style='font-size:11px;color:#888;'>" + fmt_size(f.size()) + "</span>";
+                              row += "<a class='tag t-dl' href='/dl?path=" + full + "'>DL</a>";
+                              row += "<button class='tag t-ren' onclick=\"renItem('" + full + "','" + name + "')\">Ren</button>";
+                              row += "<a class='tag t-del' href='/del?path=" + full + "&dir=" + dir + "' onclick=\"return confirm('Delete file?')\">X</a>";
+                              row += "</div>";
+                          }
+                          row += "</div>";
+                          server.sendContent(row);
+                          f = root.openNextFile();
+                      }
+                  }
+
+                  String js = "</div><script>";
+                  js += "function upFile(){var f=document.getElementById('fi').files[0];if(!f)return alert('Select file!');";
+                  js += "document.getElementById('pbox').style.display='block';";
+                  js += "var fd=new FormData();fd.append('file',f);";
+                  js += "var x=new XMLHttpRequest();x.open('POST','/upload?dir=" + dir + "',true);";
+                  js += "x.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round((e.loaded/e.total)*100);document.getElementById('pfill').style.width=p+'%';document.getElementById('ptxt').innerText='Uploading: '+p+'%';}};";
+                  js += "x.onload=function(){if(x.status==200)location.href='/?dir=" + dir + "';else alert('Upload Error!');};";
+                  js += "x.send(fd);}";
+                  js += "function mkDir(){var n=document.getElementById('nf').value.trim();if(!n)return;";
+                  js += "var d='" + dir + "';var t=(d=='/'?'':d)+'/'+n;location.href='/mkdir?path='+encodeURIComponent(t)+'&dir='+encodeURIComponent(d);}";
+                  js += "function renItem(oldP,oldN){var newN=prompt('New name:',oldN);if(!newN||newN==oldN)return;";
+                  js += "var d='" + dir + "';var newP=(d=='/'?'':d)+'/'+newN;location.href='/ren?old='+encodeURIComponent(oldP)+'&new='+encodeURIComponent(newP)+'&dir='+encodeURIComponent(d);}";
+                  js += "</script></body></html>";
+                  server.sendContent(js);
+                  server.sendContent("");
+              });
+
+              // ২. স্ট্রিমিং ফাইল আপলোড (যে কোনো ফোল্ডার ও যে কোনো ফাইল টাইপ)
+              server.on("/upload", HTTP_POST, []() {
+                  server.send(200, "text/plain", "OK");
+                  scan_firmwares();
+                  if (app_state == STATE_HOME && !is_sleeping) draw_home_ui();
+              }, []() {
+                  last_activity_ms = millis();
+                  HTTPUpload& upload = server.upload();
+                  if (upload.status == UPLOAD_FILE_START) {
+                      String dir = server.hasArg("dir") ? server.arg("dir") : cur_web_dir;
+                      if (!dir.startsWith("/")) dir = "/" + dir;
+                      String fn = upload.filename;
+                      int sl = fn.lastIndexOf('/');
+                      if (sl >= 0) fn = fn.substring(sl + 1);
+                      String fullPath = (dir == "/") ? ("/" + fn) : (dir + "/" + fn);
+                      uploadFile = LittleFS.open(fullPath, "w");
+                  } else if (upload.status == UPLOAD_FILE_WRITE) {
+                      if (uploadFile) uploadFile.write(upload.buf, upload.currentSize);
+                  } else if (upload.status == UPLOAD_FILE_END) {
+                      if (uploadFile) { uploadFile.flush(); uploadFile.close(); }
+                  }
+              });
+
+              // ৩. ডাউনলোড
+              server.on("/dl", HTTP_GET, []() {
+                  String path = server.arg("path");
+                  File f = LittleFS.open(path, "r");
+                  if (!f) { server.send(404, "text/plain", "Not Found"); return; }
+                  String fn = path;
+                  int sl = fn.lastIndexOf('/');
+                  if (sl >= 0) fn = fn.substring(sl + 1);
+                  server.sendHeader("Content-Disposition", "attachment; filename=\"" + fn + "\"");
+                  server.streamFile(f, "application/octet-stream");
+                  f.close();
+              });
+
+              // ৪. ডিলিট
+              server.on("/del", HTTP_GET, []() {
+                  String path = server.arg("path");
+                  String dir  = server.hasArg("dir") ? server.arg("dir") : "/";
+                  if (path != "/" && LittleFS.exists(path)) {
+                      File f = LittleFS.open(path);
+                      bool isD = f && f.isDirectory();
+                      if (f) f.close();
+                      if (isD) LittleFS.rmdir(path);
+                      else LittleFS.remove(path);
+                  }
+                  scan_firmwares();
+                  if (app_state == STATE_HOME && !is_sleeping) draw_home_ui();
+                  server.sendHeader("Location", "/?dir=" + dir);
+                  server.send(302, "text/plain", "");
+              });
+
+              // ৫. রিনেম
+              server.on("/ren", HTTP_GET, []() {
+                  String oldP = server.arg("old");
+                  String newP = server.arg("new");
+                  String dir  = server.hasArg("dir") ? server.arg("dir") : "/";
+                  if (oldP != "/" && LittleFS.exists(oldP)) {
+                      LittleFS.rename(oldP, newP);
+                  }
+                  scan_firmwares();
+                  if (app_state == STATE_HOME && !is_sleeping) draw_home_ui();
+                  server.sendHeader("Location", "/?dir=" + dir);
+                  server.send(302, "text/plain", "");
+              });
+
+              // ৬. নতুন ফোল্ডার তৈরি
+              server.on("/mkdir", HTTP_GET, []() {
+                  String path = server.arg("path");
+                  String dir  = server.hasArg("dir") ? server.arg("dir") : "/";
+                  LittleFS.mkdir(path);
+                  server.sendHeader("Location", "/?dir=" + dir);
+                  server.send(302, "text/plain", "");
+              });
+
+              server.begin();
           }
 
           void setup() {
               tft.init();
-              tft.setRotation(all_rotations[rot_idx]);
+              tft.setRotation(6);
+              tft.invertDisplay(false);
               tft.fillScreen(TFT_BLACK);
 
               pinMode(PIN_B1, INPUT_PULLUP);
@@ -342,50 +715,173 @@ jobs:
               pinMode(PIN_B3, INPUT_PULLUP);
 
               LittleFS.begin(true, "/vfs", 10, "vfs");
+              load_configs();
               setup_web_server();
               scan_firmwares();
-              draw_ui();
+
+              last_activity_ms = millis();
+              draw_home_ui();
           }
 
           void loop() {
               server.handleClient();
 
               int joy_x = analogRead(PIN_JOY_X);
-              static unsigned long last_move = 0;
+              int joy_y = analogRead(PIN_JOY_Y);
+              bool b1_down = (digitalRead(PIN_B1) == LOW);
+              bool b2_down = (digitalRead(PIN_B2) == LOW);
+              bool b3_down = (digitalRead(PIN_B3) == LOW);
+              bool joy_moved = (joy_x > 3000 || joy_x < 1000 || joy_y > 3000 || joy_y < 1000);
 
-              if (millis() - last_move > 250) {
-                  if (joy_x < 1000 && selected_index > 0) {
-                      selected_index--;
-                      draw_ui();
-                      last_move = millis();
-                  } else if (joy_x > 3000 && selected_index < (int)bin_files.size() - 1) {
-                      selected_index++;
-                      draw_ui();
-                      last_move = millis();
+              static unsigned long last_input = 0;
+              static unsigned long last_temp_refresh = 0;
+              static unsigned long last_anim = 0;
+
+              // ৩০ সেকেন্ড অটো-স্লিপ ও ওয়েক-আপ গার্ড
+              if (joy_moved || b1_down || b2_down || b3_down) {
+                  last_activity_ms = millis();
+                  if (is_sleeping) {
+                      is_sleeping = false;
+                      tft.setBrightness((backlight_pct * 255) / 100);
+                      delay(250);
+                      return;
+                  }
+              } else if (!is_sleeping && (millis() - last_activity_ms > IDLE_TIMEOUT_MS)) {
+                  is_sleeping = true;
+                  tft.setBrightness(0);
+              }
+
+              if (is_sleeping) {
+                  delay(50);
+                  return;
+              }
+
+              // --- ১. হোম স্ক্রিন (স্ক্রোলযোগ্য তালিকা) ---
+              if (app_state == STATE_HOME) {
+                  if (millis() - last_temp_refresh > 2000) {
+                      update_top_temp_only();
+                      last_temp_refresh = millis();
+                  }
+
+                  int total = menu_items.size();
+                  if (millis() - last_input > 200 && total > 0) {
+                      if (joy_x > 3000 && selected_idx > 0) {
+                          selected_idx--;
+                          if (selected_idx < scroll_top) scroll_top = selected_idx;
+                          draw_home_ui();
+                          last_input = millis();
+                      } else if (joy_x < 1000 && selected_idx < total - 1) {
+                          selected_idx++;
+                          if (selected_idx >= scroll_top + VISIBLE_ROWS) {
+                              scroll_top = selected_idx - VISIBLE_ROWS + 1;
+                          }
+                          draw_home_ui();
+                          last_input = millis();
+                      }
+                  }
+
+                  if (b1_down && millis() - last_input > 250) {
+                      last_input = millis();
+                      if (total > 0) {
+                          app_state = STATE_CONFIRM;
+                          confirm_sel = 1; // ডিফল্ট NO
+                          draw_confirm_dialog();
+                      }
+                  }
+
+                  if (b2_down && millis() - last_input > 250) {
+                      last_input = millis();
+                      scan_firmwares();
+                      draw_home_ui();
+                  }
+
+                  if (b3_down && millis() - last_input > 250) {
+                      last_input = millis();
+                      app_state = STATE_SYS_MENU;
+                      sys_menu_sel = 0;
+                      draw_sys_menu();
                   }
               }
+              // --- ২. সিস্টেম মেনু (B3 দিয়ে ওপেন: ব্রাইটনেস, ৪ থিম, অ্যানিমেটেড বট, ক্রেডিট) ---
+              else if (app_state == STATE_SYS_MENU) {
+                  // লাইটওয়েট অ্যানিমেটেড মিনি-বট চোখ ব্লিংক (প্রতি ৪৫০ms এ)
+                  if (millis() - last_anim > 450) {
+                      mascot_blink = !mascot_blink;
+                      draw_mini_bot(262, 186, ui_themes[active_theme].primary, mascot_blink);
+                      last_anim = millis();
+                  }
 
-              // B1: ওএস স্থায়ীভাবে বুট
-              if (digitalRead(PIN_B1) == LOW) {
-                  delay(150);
-                  if (!bin_files.empty()) {
-                      flash_and_reboot(bin_files[selected_index]);
+                  if (millis() - last_input > 200) {
+                      if (joy_x > 3000 && sys_menu_sel > 0) {
+                          sys_menu_sel--;
+                          draw_sys_menu();
+                          last_input = millis();
+                      } else if (joy_x < 1000 && sys_menu_sel < 1) {
+                          sys_menu_sel++;
+                          draw_sys_menu();
+                          last_input = millis();
+                      }
+
+                      if (sys_menu_sel == 0) {
+                          if (joy_y > 3000 && backlight_pct < 100) {
+                              save_brightness(backlight_pct + 10);
+                              draw_sys_menu();
+                              last_input = millis();
+                          } else if (joy_y < 1000 && backlight_pct > 10) {
+                              save_brightness(backlight_pct - 10);
+                              draw_sys_menu();
+                              last_input = millis();
+                          }
+                      } else if (sys_menu_sel == 1) {
+                          if (joy_y > 3000) {
+                              save_theme(active_theme + 1);
+                              draw_sys_menu();
+                              last_input = millis();
+                          } else if (joy_y < 1000) {
+                              save_theme((active_theme + 3) % 4);
+                              draw_sys_menu();
+                              last_input = millis();
+                          }
+                      }
+                  }
+
+                  if (b1_down && millis() - last_input > 250) {
+                      last_input = millis();
+                      if (sys_menu_sel == 1) {
+                          save_theme(active_theme + 1);
+                          draw_sys_menu();
+                      }
+                  }
+
+                  if ((b2_down || b3_down) && millis() - last_input > 250) {
+                      last_input = millis();
+                      app_state = STATE_HOME;
+                      draw_home_ui();
                   }
               }
+              // --- ৩. কনফার্মেশন ডায়ালগ ---
+              else if (app_state == STATE_CONFIRM) {
+                  if (millis() - last_input > 200) {
+                      if (joy_y < 1000) { confirm_sel = 0; draw_confirm_dialog(); last_input = millis(); }
+                      if (joy_y > 3000) { confirm_sel = 1; draw_confirm_dialog(); last_input = millis(); }
+                  }
 
-              // B2: রিলোড
-              if (digitalRead(PIN_B2) == LOW) {
-                  delay(150);
-                  scan_firmwares();
-                  draw_ui();
-              }
+                  if (b1_down && millis() - last_input > 250) {
+                      last_input = millis();
+                      if (confirm_sel == 0) {
+                          if (item_is_quick[selected_idx]) boot_slot2_now();
+                          else flash_and_reboot(menu_items[selected_idx]);
+                      } else {
+                          app_state = STATE_HOME;
+                          draw_home_ui();
+                      }
+                  }
 
-              // B3: লাইভ রোটেশন সাইকেল (০ থেকে ৭) — টিপলেই ডিসপ্লে সোজা হবে!
-              if (digitalRead(PIN_B3) == LOW) {
-                  delay(250);
-                  rot_idx = (rot_idx + 1) % 8;
-                  tft.setRotation(all_rotations[rot_idx]);
-                  draw_ui();
+                  if (b2_down && millis() - last_input > 250) {
+                      last_input = millis();
+                      app_state = STATE_HOME;
+                      draw_home_ui();
+                  }
               }
 
               delay(20);

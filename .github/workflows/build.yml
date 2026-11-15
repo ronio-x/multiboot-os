@@ -1,4 +1,4 @@
-name: Build Master Multi-Boot Launcher (Unbrickable Pro)
+name: Build Master Multi-Boot Launcher (Unbrickable Pro 5MB)
 
 on:
   workflow_dispatch:
@@ -16,16 +16,17 @@ jobs:
           sudo apt-get install -y python3 python3-pip
           pip3 install --upgrade platformio esptool
 
-      - name: Build Custom Hardware-Recovery Bootloader (B3 GPIO 40)
+      - name: Build Custom Hardware-Recovery Bootloader (16MB + B3 GPIO 40)
         run: |
           mkdir -p boot_proj/src
 
+          # ২.০ MB (Launcher) + ৫.০ MB (Guest Slot 2) + ~৮.৯ MB (VFS Storage)
           cat << 'EOF' > boot_proj/partitions.csv
           # Name,   Type, SubType, Offset,   Size,     Flags
           nvs,      data, nvs,     0x9000,   0x6000,
           otadata,  data, ota,     0xf000,   0x2000,
-          factory,  app,  factory, 0x20000,  0x380000,
-          ota_0,    app,  ota_0,   0x3a0000, 0x380000,
+          factory,  app,  factory, 0x20000,  0x200000,
+          ota_0,    app,  ota_0,   0x220000, 0x500000,
           vfs,      data, fat,     0x720000, 0x8e0000,
           EOF
 
@@ -34,6 +35,10 @@ jobs:
           platform = espressif32
           board = esp32-s3-devkitc-1
           framework = espidf
+          board_build.flash_mode = qio
+          board_build.f_flash = 80000000L
+          board_upload.flash_size = 16MB
+          board_upload.maximum_size = 16777216
           board_build.partitions = partitions.csv
           EOF
 
@@ -41,7 +46,10 @@ jobs:
           CONFIG_IDF_TARGET="esp32s3"
           CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
           CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+          CONFIG_ESPTOOLPY_FLASHSIZE_4MB=n
+          CONFIG_ESPTOOLPY_FLASHSIZE_8MB=n
           CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+          CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
           CONFIG_PARTITION_TABLE_CUSTOM=y
           CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
           CONFIG_PARTITION_TABLE_OFFSET=0x8000
@@ -68,7 +76,7 @@ jobs:
           EOF
 
           cd boot_proj
-          pio run
+          pio run -t bootloader
           ls -lh .pio/build/custom_boot/bootloader.bin
 
       - name: Generate Pro Multi-Boot Launcher Project
@@ -354,32 +362,26 @@ jobs:
               UITheme th = ui_themes[active_theme];
               int total = menu_items.size();
 
-              // স্ট্যাটাস বার: BOOT | 38C | WIFI [LED] | [01/XX]
               tft.fillRect(0, 0, 320, 24, th.dark_card);
               tft.setTextColor(th.primary);
               tft.setTextSize(2);
               tft.drawString("BOOT", 6, 4);
 
-              // T: বাদ দিয়ে সরাসরি তাপমাত্রা
               int t = (int)temperatureRead();
               tft.setTextColor(get_temp_color(t));
               tft.drawString(String(t) + "C", 64, 4);
 
-              // WIFI টেক্সট ও সলিড ভার্চুয়াল LED লাইট বক্স
               tft.setTextColor(wifi_enabled ? TFT_WHITE : 0x7BEF);
               tft.drawString("WIFI", 124, 4);
               if (wifi_enabled) {
-                  // উজ্জ্বল সবুজ জ্বলন্ত LED (হোয়াইট স্পেকুলার পিক্সেল সহ)
                   tft.fillRect(178, 6, 12, 12, 0x07E0);
                   tft.drawRect(178, 6, 12, 12, TFT_WHITE);
                   tft.fillRect(180, 8, 3, 3, TFT_WHITE);
               } else {
-                  // অফ গ্রে LED
                   tft.fillRect(178, 6, 12, 12, 0x3186);
                   tft.drawRect(178, 6, 12, 12, 0x528A);
               }
 
-              // আইটেম কাউন্টার
               tft.setTextColor(TFT_WHITE);
               if (total > 0) {
                   tft.drawRightString("[" + String(selected_idx + 1) + "/" + String(total) + "]", 314, 4);
@@ -388,7 +390,6 @@ jobs:
               }
               tft.drawFastHLine(0, 24, 320, th.primary);
 
-              // ৬টি স্ক্রোলযোগ্য আইটেম + স্ক্রোলবার
               int y = 30;
               if (total == 0) {
                   tft.setTextColor(TFT_WHITE);
@@ -396,7 +397,7 @@ jobs:
                   tft.drawCenterString("No firmwares found!", 160, 75);
                   tft.setTextSize(1);
                   tft.setTextColor(th.primary);
-                  tft.drawCenterString("Press B3 -> Turn WiFi ON to upload", 160, 115);
+                  tft.drawCenterString("Press B3 -> Turn WIFI ON to upload", 160, 115);
                   tft.drawCenterString("Hold B3 + Reset anytime for Rescue!", 160, 135);
                   tft.setTextColor(TFT_WHITE);
                   tft.drawCenterString("dev: github/ronio_x", 160, 165);
@@ -451,7 +452,6 @@ jobs:
               }
           }
 
-          // --- সিস্টেম / পজ মেনু (B3 দিয়ে ওপেন: WiFi, ব্রাইটনেস, ৪ থিম, VFS ও Slot2 বার, ক্রেডিট ও রোবট) ---
           void draw_sys_menu() {
               UITheme th = ui_themes[active_theme];
 
@@ -462,15 +462,13 @@ jobs:
               tft.drawString("SYSTEM MENU", 26, 14);
               tft.drawFastHLine(24, 34, 272, th.primary);
 
-              // ০: Wi-Fi টগল
               int y = 40;
               bool sel0 = (sys_menu_sel == 0);
               tft.fillRect(24, y, 272, 26, sel0 ? th.primary : th.dark_card);
               tft.setTextColor(sel0 ? TFT_BLACK : TFT_WHITE);
               tft.setTextSize(2);
-              tft.drawString(wifi_enabled ? "WiFi: [ON 192.168.4.1]" : "WiFi: [ OFF ]", 32, y + 5);
+              tft.drawString(wifi_enabled ? "WIFI: [ON 192.168.4.1]" : "WIFI: [ OFF ]", 32, y + 5);
 
-              // ১: ব্রাইটনেস কন্ট্রোল বার
               y = 70;
               bool sel1 = (sys_menu_sel == 1);
               tft.fillRect(24, y, 272, 34, sel1 ? th.dark_card : 0x0000);
@@ -481,7 +479,6 @@ jobs:
               tft.drawRect(32, y + 16, 256, 10, TFT_WHITE);
               tft.fillRect(34, y + 18, (backlight_pct * 252) / 100, 6, th.primary);
 
-              // ২: ৪টি গ্লোবাল থিম
               y = 108;
               bool sel2 = (sys_menu_sel == 2);
               tft.fillRect(24, y, 272, 26, sel2 ? th.primary : th.dark_card);
@@ -489,7 +486,6 @@ jobs:
               tft.setTextSize(2);
               tft.drawString("Theme: " + String(th.name), 32, y + 5);
 
-              // ৩: VFS ফ্রি বার
               size_t vfs_tot = LittleFS.totalBytes();
               size_t vfs_used = LittleFS.usedBytes();
               size_t vfs_free = (vfs_tot > vfs_used) ? (vfs_tot - vfs_used) : 0;
@@ -502,18 +498,17 @@ jobs:
               tft.drawRect(32, y + 10, 256, 7, 0x4208);
               tft.fillRect(34, y + 12, vfs_pct, 3, TFT_CYAN);
 
-              // ৪: Slot 2 লোড বার এবং কোন ফার্মওয়্যার চলছে
+              // স্লট ২ এখন ৫.০ MB!
               y = 163;
               float s2_mb = (float)last_os_size / 1048576.0;
-              int s2_pct = (last_os_size > 0) ? min(252, (int)((last_os_size * 252) / 3670016)) : 0;
-              String s2_txt = "Slot2: " + String(s2_mb, 1) + "/3.5M (" + last_os_name + ")";
+              int s2_pct = (last_os_size > 0) ? min(252, (int)((last_os_size * 252) / 5242880)) : 0;
+              String s2_txt = "Slot2: " + String(s2_mb, 1) + "/5.0M (" + last_os_name + ")";
               if (s2_txt.length() > 41) s2_txt = s2_txt.substring(0, 39) + "..";
               tft.setTextColor(TFT_YELLOW);
               tft.drawString(s2_txt, 32, y);
               tft.drawRect(32, y + 10, 256, 7, 0x4208);
               tft.fillRect(34, y + 12, s2_pct, 3, TFT_YELLOW);
 
-              // ৫: VFS ও Slot 2 বারের নিচে স্ক্রিনের মাঝে ক্রেডিট + ডানে অ্যানিমেটেড মিনি-রোবট
               tft.setTextSize(1);
               tft.setTextColor(TFT_WHITE);
               tft.drawCenterString("dev: github/ronio_x", 150, 200);
@@ -602,7 +597,17 @@ jobs:
                   }
               }
 
-              // প্রি-ফ্ল্যাশ ভ্যালিডেশন: ESP32-S3 Chip ID (0x0009) ও 0xE9 ম্যাজিক বাইট চেক
+              if (appSize > 5242880) {
+                  tft.fillScreen(TFT_BLACK);
+                  tft.setTextColor(TFT_RED);
+                  tft.setTextSize(2);
+                  tft.drawCenterString("FILE > 5.0 MB LIMIT!", 160, 100);
+                  file.close();
+                  delay(2500);
+                  draw_home_ui();
+                  return;
+              }
+
               uint8_t img_hdr[24] = {0};
               file.seek(appOffset);
               file.read(img_hdr, 24);
@@ -849,7 +854,7 @@ jobs:
 
               LittleFS.begin(true, "/vfs", 10, "vfs");
               load_configs();
-              WiFi.mode(WIFI_OFF); // ডিফল্ট Wi-Fi OFF
+              WiFi.mode(WIFI_OFF);
               scan_firmwares();
 
               last_activity_ms = millis();
@@ -1028,7 +1033,7 @@ jobs:
           cd launcher_project
           pio run
 
-          echo "Merging Custom Recovery Bootloader + Partitions + Launcher..."
+          echo "Merging Custom Recovery Bootloader + Partitions + 2MB Launcher..."
           esptool.py --chip esp32s3 merge_bin \
             -o .pio/build/esp32-s3-launcher/Master_Launcher_Complete_0x0.bin \
             --flash_mode qio --flash_size 16MB \
